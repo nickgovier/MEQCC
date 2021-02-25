@@ -23,6 +23,13 @@
 
 #include "pr_comp.h"
 
+#define PRECOMP
+#define QDECL
+#define MAX_QPATH		144
+
+//MrE
+void *mymalloc(size_t size);
+
 /*
 
 TODO:
@@ -256,6 +263,11 @@ typedef struct def_s
 	gofs_t		ofs;
 	struct def_s	*scope;		// function the var was defined in, or NULL
 	int			initialized;	// 1 when a declaration included "= immediate"
+	//MrE
+	int internuse;          // 1 when the function is only used inside
+                           // the QuakeC code
+	struct def_s *valuehashnext;	// next def in the value hash chain
+	struct def_s *namehashnext;	// next def in the name hash chain
 } def_t;
 
 //============================================================================
@@ -266,7 +278,9 @@ typedef struct def_s
 
 #define	MAX_NAME		64		// chars long
 
-#define	MAX_REGS		16384
+//MrE: replaced '#define  MAX_REGS    16384' by
+//NOTE: can't go over 2^15, this is a Quake internal limit
+#define	MAX_REGS		32768
 
 //=============================================================================
 
@@ -348,6 +362,8 @@ extern	eval_t		pr_immediate;
 
 void PR_PrintStatement (dstatement_t *s);
 
+void PR_LoadSource(char *filename);
+void PR_FreeSource(void);
 void PR_Lex (void);
 // reads the next token into pr_token and classifies its type
 
@@ -399,7 +415,7 @@ char *PR_ValueString (etype_t type, void *val);
 
 void PR_ClearGrabMacros (void);
 
-boolean	PR_CompileFile (char *string, char *filename);
+boolean  PR_CompileFile (char *filename);
 
 extern	boolean	pr_dumpasm;
 
@@ -410,10 +426,10 @@ extern	def_t	def_ret, def_parms[MAX_PARMS];
 //=============================================================================
 
 #define	MAX_STRINGS		500000
-#define	MAX_GLOBALS		16384
-#define	MAX_FIELDS		1024
-#define	MAX_STATEMENTS	65536
-#define	MAX_FUNCTIONS	8192
+#define	MAX_GLOBALS		100000
+#define	MAX_FIELDS		2024
+#define	MAX_STATEMENTS	200000
+#define	MAX_FUNCTIONS	16384
 
 #define	MAX_SOUNDS		1024
 #define	MAX_MODELS		1024
@@ -423,29 +439,66 @@ extern	def_t	def_ret, def_parms[MAX_PARMS];
 extern	char	strings[MAX_STRINGS];
 extern	int		strofs;
 
+#define CHECK_STRINGS_BUFFER if                          \
+(strofs > MAX_STRINGS || strofs < 0)                     \
+{                                                        \
+   Error("total string length exceeds buffer");          \
+}
+
 extern	dstatement_t	statements[MAX_STATEMENTS];
 extern	int			numstatements;
 extern	int			statement_linenums[MAX_STATEMENTS];
+#define CHECK_STATEMENT_BUFFER if                        \
+(numstatements > MAX_STATEMENTS || numstatements < 0)    \
+{                                                        \
+   Error("number of statements exceeds buffer");         \
+}
+
 
 extern	dfunction_t	functions[MAX_FUNCTIONS];
 extern	int			numfunctions;
+#define CHECK_FUNCTIONS_BUFFER if                        \
+(numfunctions > MAX_FUNCTIONS || numfunctions < 0)       \
+{                                                        \
+   Error("number of functions exceeds buffer");          \
+}
 
 extern	float		pr_globals[MAX_REGS];
 extern	int			numpr_globals;
+#define CHECK_PR_GLOBALS_BUFFER if                       \
+(numpr_globals > MAX_REGS || numpr_globals < 0)          \
+{                                                        \
+   Error("number of globals exceeds buffer");            \
+}
 
 extern	char	pr_immediate_string[2048];
 
 extern	char		precache_sounds[MAX_SOUNDS][MAX_DATA_PATH];
 extern	int			precache_sounds_block[MAX_SOUNDS];
 extern	int			numsounds;
+#define CHECK_MAX_SOUNDS if                              \
+(numsounds > MAX_SOUNDS || numsound < 0)                 \
+{                                                        \
+   Error("number of sounds exceeds buffer");             \
+}
 
 extern	char		precache_models[MAX_MODELS][MAX_DATA_PATH];
 extern	int			precache_models_block[MAX_SOUNDS];
 extern	int			nummodels;
+#define CHECK_MAX_MODELS if                              \
+(nummodels > MAX_MODELS || nummodels < 0)                \
+{                                                        \
+   Error("number of models exceeds buffer");             \
+}
 
 extern	char		precache_files[MAX_FILES][MAX_DATA_PATH];
 extern	int			precache_files_block[MAX_SOUNDS];
 extern	int			numfiles;
+#define CHECK_MAX_FILES if                               \
+(numfiles > MAX_FILES || numfiles < 0)                   \
+{                                                        \
+   Error("number of files exceeds buffer");              \
+}
 
 int	CopyString (char *str);
 

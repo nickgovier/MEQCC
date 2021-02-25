@@ -19,12 +19,25 @@
 
 #include "qcc.h"
 
+#include <time.h>
+#include <stdio.h>
+#include <io.h> //lseek, close, filelength
+#if defined(WIN32)|defined(_WIN32)|defined(__NT__)|defined(__WINDOWS__)|defined(__WINDOWS_386__)
+#include <direct.h> //mkdir
+#endif
+
+#include "l_log.h"
+#ifdef PRECOMP
+#include "l_script.h"
+#include "l_precomp.h"
+#endif //PRECOMP
 
 char		destfile[1024];
 
 float		pr_globals[MAX_REGS];
 int			numpr_globals;
 
+int				pr_globals_isstring[MAX_REGS]; //MrE
 char		strings[MAX_STRINGS];
 int			strofs;
 
@@ -33,6 +46,7 @@ int			numstatements;
 int			statement_linenums[MAX_STATEMENTS];
 
 dfunction_t	functions[MAX_FUNCTIONS];
+char		unusedfunctionname[MAX_FUNCTIONS]; //MrE
 int			numfunctions;
 
 ddef_t		globals[MAX_GLOBALS];
@@ -53,6 +67,40 @@ char		precache_files[MAX_FILES][MAX_DATA_PATH];
 int			precache_files_block[MAX_SOUNDS];
 int			numfiles;
 
+//undecompilable data flag
+int undecompilabledata = 0;
+
+/*
+=================
+mymalloc
+=================
+*/
+void *mymalloc(size_t size)
+{
+	void *ptr;
+	ptr = malloc(size);
+	if (ptr == NULL) Error("out of memory");
+	return ptr;
+} //end of the function mymalloc
+
+/*
+=================
+NewCheckParm
+=================
+*/
+int NewCheckParm(char *check)
+{
+	int i;
+
+	for (i = 1; i < myargc; i++)
+	{
+		if (myargv[i][0] == '-' || myargv[i][0] == '/')
+		{
+			if (!strcmpi(check, &myargv[i][1])) return i;
+		} //end if
+	} //end for
+	return 0;
+} //end of the function NewCheckParm
 
 /*
 =================
@@ -70,7 +118,7 @@ void BspModels (void)
 	char	cmd[1024];
 	char	name[256];
 
-	p = CheckParm ("-bspmodels");
+	p = NewCheckParm("bspmodels");
 	if (!p)
 		return;
 	if (p == myargc-1)
@@ -97,6 +145,7 @@ int	CopyString (char *str)
 	old = strofs;
 	strcpy (strings+strofs, str);
 	strofs += strlen(str)+1;
+	CHECK_STRINGS_BUFFER;
 	return old;
 }
 
@@ -178,6 +227,362 @@ void InitData (void)
 		def_parms[i].ofs = OFS_PARM0 + 3*i;
 }
 
+/*
+=================
+ClearString
+=================
+*/
+void ClearString(char *name)
+{
+	int len;
+	len = strlen(name);
+	memset(name, 0, len);
+} //end of the function ClearString
+
+/*
+=================
+RemoveAllFieldsNamed
+=================
+*/
+void RemoveAllFieldsNamed(char *name)
+{
+	int i;
+	char *fname;
+	for (i = 0; i < numfielddefs; i++)
+	{
+		fname = strings + fields[i].s_name;
+		if (!strcmpi(fname, name))
+		{
+			ClearString(fname);
+//			memset(fname, 0, strlen(fname));
+			fields[i].s_name = 0;
+		} //end if
+	} //end for
+} //end of the function RemoveAllFieldsNamed
+
+/*
+=================
+MandatoryFunction
+
+returns true if the function name is mandatory
+=================
+*/
+char *mandatoryfunctions[] =
+{
+	"main",
+	"StartFrame",
+	"PlayerPreThink",
+	"PlayerPostThink",
+	"ClientKill",
+	"ClientConnect",
+	"PutClientInServer",
+	"ClientDisconnect",
+	"SetNewParms",
+	"SetChangeParms",
+	""
+};
+
+int MandatoryFunction(char *name)
+{
+	int i;
+	for (i = 0; strlen(mandatoryfunctions[i]); i++)
+	{
+		if (!strcmpi(mandatoryfunctions[i], name)) return 1;
+	} //end if
+	return 0;
+} //end of the function MandatoryFunction
+
+/*
+=================
+FunctionUsedIntern
+
+  returns true if the function is called from somewhere in the QuakeC code
+=================
+*/
+int FunctionUsedIntern(char *name)
+{
+	def_t *def;
+	for (def = pr.def_head.next; def; def = def->next)
+	{
+		if (def->internuse)
+		{
+			if (def->type->type == ev_function)
+			{
+				if (!strcmpi(def->name, name))
+				{
+					return 1;
+				} //end if
+			} //end if
+		} //end if
+	} //end for
+	return 0;
+} //end of the function FunctionUsedIntern
+
+/*
+=================
+UnusedFunctionName
+
+returns true if the function can be renamed
+=================
+*/
+int UnusedFunctionName(dfunction_t *f)
+{
+	//if it is a builtin function
+//	if (f->first_statement < 0) return 0;
+	//if the function is one of the mandatory ones
+	if (MandatoryFunction(strings + f->s_name)) return 0;
+	//if the function is not used inside the QuakeC code it is assumed
+	//to be a spawn function and may not be renamed
+	if (!FunctionUsedIntern(strings + f->s_name)) return 0;
+	return 1;
+} //end of the function UnusedFunctionName
+
+/*
+=================
+PrintStatus
+=================
+*/
+void PrintStatus(int cur, int total)
+{
+	printf("\b\b\b\b% 3d%%", cur * 100 / total);
+} //end of the function PrintStatus
+
+/*
+=================
+WriteUndecFile
+=================
+*/
+void WriteUndecFile(void)
+{
+	int cur, total, i;
+	int deletefields;
+	def_t *d;
+	FILE *fp;
+
+	total = numfunctions << 1;
+	cur = 0;
+	fp = fopen("undec.txt", "w");
+	if (!fp) Error("Error creating undec.txt\n");
+	printf("\nWriting undec.txt     ");
+	fprintf(fp, "//The following functions were called from inside\n"
+				"//the QuakeC code, used in an assignment or used\n"
+				"//in a state function.\n\n");
+	for (i = 0; i < numfunctions; i++)
+	{
+		if (unusedfunctionname[i])
+		{
+			fprintf(fp, "%-50s %s\n", strings + functions[i].s_name,
+							strings + functions[i].s_file);
+		} //end if
+		PrintStatus(++cur, total);
+	} //end for
+	fprintf(fp, "\n//The following functions were not used anywhere\n"
+				"//inside the Quake C code or are builtin functions.\n\n");
+	for (i = 0; i < numfunctions; i++)
+	{
+		if (!unusedfunctionname[i])
+		{
+			fprintf(fp, "%-50s %s\n", strings + functions[i].s_name,
+						strings + functions[i].s_file);
+		} //end if
+		PrintStatus(++cur, total);
+	} //end for
+	fprintf(fp, "\n//removed the following entity fields:\n\n");
+	deletefields = 0;
+	for (d = pr.def_head.next; d; d = d->next)
+	{
+		if (!deletefields)
+		{
+			if (strstr(d->name, "start_remove_fieldnames"))
+			{
+				deletefields = 1;
+			} //end if
+		} //end if
+		else
+		{
+			if (strstr(d->name, "end_remove_fieldnames"))
+			{
+				deletefields = 0;
+			} //end if
+			else
+			{
+				if (d->type->type == ev_field)
+				{
+					fprintf(fp, "%s\n", d->name);
+				} //end if
+			} //end else
+		} //end else
+	} //end for
+	fclose(fp);
+} //end of the function WriteUndecFile
+
+/*
+=================
+CreateUndecompilableData
+=================
+*/
+void CreateUnDecompilableData(void)
+{
+	int i, cur, total;
+	int deletefields;
+	char *name;
+	char tmpname[1024];
+	def_t *d;
+
+	Log_Print("\nCreating undecompilable data...");
+	Log_Print("\nMarking all unused function names:     ");
+	total = numfunctions;
+	cur = 0;
+	//mark all the unused function names
+	for (i = 0; i < numfunctions; i++)
+	{
+		//clear the name of the function if possible
+		if (UnusedFunctionName(&functions[i]))
+		{
+			unusedfunctionname[i] = 1;
+		} //end if
+		PrintStatus(++cur, total);
+	} //end for
+	//dump a undec.txt if wanted
+	if (undecompilabledata == 2) WriteUndecFile();
+	//remove all function names
+	Log_Print("\nRemoving all unused function names:     ");
+	total = numfunctions;
+	cur = 0;
+	for (i = 0; i < numfunctions; i++)
+	{
+		//offset into the string heap of the name of the .QC file
+		//the function was defined in
+		name = strings + functions[i].s_file;
+		memset(name, 0, strlen(name));
+		functions[i].s_file = -1;//0;
+		//clear the function name if unused
+		if (unusedfunctionname[i])
+		{
+			name = strings + functions[i].s_name;
+			ClearString(name);
+			functions[i].s_name = 0;
+		} //end if
+		PrintStatus(++cur, total);
+	} //end for
+	Log_Print("\nRemoving all global names:     ");
+	total = numglobaldefs;
+	cur = 0;
+	//clear all the all the variable names
+	for (i = 0; i < numglobaldefs; i++)
+	{
+		name = strings + globals[i].s_name;
+		ClearString(name);
+		globals[i].s_name = 0;
+		PrintStatus(++cur, total);
+	} //end for
+	Log_Print("\nRemoving all removable entity field names...");
+	deletefields = 0;
+	for (d = pr.def_head.next; d; d = d->next)
+	{
+		if (!deletefields)
+		{
+			if (strstr(d->name, "start_remove_fieldnames"))
+			{
+				deletefields = 1;
+				//remove the start_remove_fieldnames
+				strcpy(tmpname, d->name);
+				RemoveAllFieldsNamed(tmpname);
+			} //end if
+		} //end if
+		else
+		{
+			if (strstr(d->name, "end_remove_fieldnames"))
+			{
+				deletefields = 0;
+				//remove the end_remove_fieldnames
+				strcpy(tmpname, d->name);
+				RemoveAllFieldsNamed(tmpname);
+			} //end if
+			else
+			{
+				if (d->type->type == ev_field)
+				{
+					strcpy(tmpname, d->name);
+					RemoveAllFieldsNamed(tmpname);
+				} //end if
+			} //end if
+		} //end else
+	} //end for
+	Log_Print("\n\n");
+} //end of the function CreateUnDecompilableData
+
+/*
+=================
+OptimizeStringHeap
+=================
+*/
+void OptimizeStringHeap(void)
+{
+	char *oldstrings, *name;
+	int i, oldstrofs, ofs;
+
+	Log_Print("optimizing string heap...\n");
+	//
+	oldstrings = mymalloc(MAX_STRINGS * sizeof(char));
+	oldstrofs = strofs;
+	//
+	memcpy(oldstrings, strings, strofs + 1);
+	strofs = 0;
+	//copy empty string at start of string heap
+	CopyString("\0");
+	//do function names
+	for (i = 0; i < numfunctions; i++)
+	{
+		name = oldstrings + functions[i].s_name;
+		if (strlen(name))
+		{
+			functions[i].s_name = CopyString(name);
+		} //end if
+		else functions[i].s_name = 0;
+	} //end for
+	for (i = 0; i < numfielddefs; i++)
+	{
+     	name = oldstrings + fields[i].s_name;
+		//remove all the field names ending on _x, _y or _z
+		if (name[strlen(name)-2] == '_')
+		{
+			if (name[strlen(name)-1] == 'x' ||
+					name[strlen(name)-1] == 'y' ||
+						name[strlen(name)-1] == 'z')
+			{
+				name[0] = 0;
+			} //end if
+		} //end if
+		if (strlen(name))
+		{
+			fields[i].s_name = CopyString(name);;
+		} //end if
+		else fields[i].s_name = 0;
+	} //end for
+	for (i = 0; i < numglobaldefs; i++)
+	{
+		name = oldstrings + globals[i].s_name;
+		if (strlen(name))
+		{
+			globals[i].s_name = CopyString(name);
+		} //end if
+		else globals[i].s_name = 0;
+	} //end for
+	//
+	for (i = 0; i < numpr_globals; i++)
+	{
+		if (pr_globals_isstring[i])
+		{
+			ofs = ((int *)pr_globals)[i];
+			if (ofs < 0) Error("((int *)pr_globals)[i] < 0");
+			if (ofs > oldstrofs) Error("((int *)pr_globals)[i] > oldstrofs");
+			name = oldstrings + ofs;
+			((int *)pr_globals)[i] = CopyString(name);
+		} //end if
+	} //end for
+	free(oldstrings);
+} //end of the function OptimizeStringHeap
 
 void WriteData (int crc)
 {
@@ -187,6 +592,7 @@ void WriteData (int crc)
 	int			h;
 	int			i;
 
+	//create the fields and globaldefs (ddef_t) out of the def_t
 	for (def = pr.def_head.next ; def ; def = def->next)
 	{
 		if (def->type->type == ev_function)
@@ -219,15 +625,26 @@ void WriteData (int crc)
 //PrintFunctions ();
 //PrintFields ();
 //PrintGlobals ();
+
+	if (undecompilabledata)
+	{
+		CreateUnDecompilableData();
+		OptimizeStringHeap();
+	} //end if
+   
 strofs = (strofs+3)&~3;
 
-	printf ("%6i strofs\n", strofs);
-	printf ("%6i numstatements\n", numstatements);
-	printf ("%6i numfunctions\n", numfunctions);
-	printf ("%6i numglobaldefs\n", numglobaldefs);
-	printf ("%6i numfielddefs\n", numfielddefs);
-	printf ("%6i numpr_globals\n", numpr_globals);
-	
+	Log_Print("-------------------------------------------------\n");
+	Log_Print("strofs        = %6i, max = %i\n", strofs, MAX_STRINGS);
+	Log_Print("numstatements = %6i, max = %i\n", numstatements, MAX_STATEMENTS);
+	Log_Print("numfunctions  = %6i, max = %i\n", numfunctions, MAX_FUNCTIONS);
+	Log_Print("numglobaldefs = %6i, max = %i\n", numglobaldefs, MAX_GLOBALS);
+	Log_Print("numfielddefs  = %6i, max = %i\n", numfielddefs, MAX_FIELDS);
+	Log_Print("numpr_globals = %6i, max = %i\n", numpr_globals, MAX_REGS);
+	Log_Print("nummodels     = %6i, max = %i\n", nummodels, MAX_MODELS);
+	Log_Print("numsounds     = %6i, max = %i\n", numsounds, MAX_SOUNDS);
+	Log_Print("numfiles      = %6i, max = %i\n", numfiles, MAX_FILES);
+
 	h = SafeOpenWrite (destfile);
 	SafeWrite (h, &progs, sizeof(progs));
 
@@ -285,7 +702,8 @@ strofs = (strofs+3)&~3;
 		((int *)pr_globals)[i] = LittleLong (((int *)pr_globals)[i]);
 	SafeWrite (h, pr_globals, numpr_globals*4);
 
-	printf ("%6i TOTAL SIZE\n", (int)lseek (h, 0, SEEK_CUR));	
+	Log_Print("total size    = %6i\n", (int) lseek(h, 0, SEEK_CUR));
+	Log_Print("-------------------------------------------------\n");
 
 	progs.entityfields = pr.size_fields;
 
@@ -751,7 +1169,7 @@ int	PR_WriteProgdefs (char *filename)
 	CRC_Init (&crc);
 	f = fopen (filename, "r+");
 	while ((c = fgetc(f)) != EOF)
-		CRC_ProcessByte (&crc, c);
+		CRC_ProcessByte (&crc, (byte) c);
 		
 	fprintf (f,"#define PROGHEADER_CRC %i\n", crc);
 	fclose (f);
@@ -811,8 +1229,13 @@ int			packbytes;
 
 void Sys_mkdir (char *path)
 {
+#if defined(WIN32)|defined(_WIN32)|defined(__NT__)|defined(__WINDOWS__)|defined(__WINDOWS_386__)
+	if (mkdir (path) != -1)
+		return;
+#else
 	if (mkdir (path, 0777) != -1)
 		return;
+#endif
 	if (errno != EEXIST)
 		Error ("mkdir %s: %s",path, strerror(errno)); 
 }
@@ -934,12 +1357,9 @@ void CopyFiles (void)
 	int		blocknum;
 	unsigned short		crc;
 
-	printf ("%3i unique precache_sounds\n", numsounds);
-	printf ("%3i unique precache_models\n", nummodels);
-	
 	copytype = 0;
 
-	p = CheckParm ("-copy");
+	p = NewCheckParm("copy");
 	if (p && p < myargc-2)
 	{	// create a new directory tree
 		copytype = 1;
@@ -953,11 +1373,11 @@ void CopyFiles (void)
 	}
 
 	blocknum = 1;
-	p = CheckParm ("-pak2");
+	p = NewCheckParm("pak2");
 	if (p && p <myargc-2)
 		blocknum = 2;
 	else
-		p = CheckParm ("-pak");
+		p = NewCheckParm("pak");
 	if (p && p < myargc-2)
 	{	// create a pak file
 		strcpy (srcdir, myargv[p+1]);
@@ -975,6 +1395,9 @@ void CopyFiles (void)
 	if (!copytype)
 		return;
 				
+	printf ("%3i unique precache_sounds\n", numsounds);
+	printf ("%3i unique precache_models\n", nummodels);
+            
 	for (i=0 ; i<numsounds ; i++)
 	{
 		if (precache_sounds_block[i] != blocknum)
@@ -1037,6 +1460,30 @@ void CopyFiles (void)
 }
 
 //============================================================================
+/*
+=================
+CMDPrecompilerDefinitions
+=================
+*/
+void CMDPrecompilerDefinitions(void)
+{
+	int i;
+
+	for (i = 0; i < myargc; i++)
+	{
+		if ((myargv[i][0] == '-' || myargv[i][0] == '/') && !stricmp(&myargv[i][1], "d"))
+		{
+			//if there's a next parameter and it isn't a command line option
+			if (i + 1 < myargc && myargv[i+1][0] != '-' && myargv[i+1][0] != '/')
+			{
+#ifdef PRECOMP
+				Log_Write("#define %s\n", myargv[i+1]);
+				PC_AddGlobalDefine(myargv[i+1]);
+#endif //PRECOMP
+			}
+		}
+	}
+}
 
 /*
 ============
@@ -1046,29 +1493,49 @@ main
 void main (int argc, char **argv)
 {
 	char	*src;
-	char	*src2;
 	char	filename[1024];
 	int		p, crc;
 	char	sourcedir[1024];
+	clock_t start_time;
 
 	myargc = argc;
 	myargv = argv;
+
+	Log_Open("meqcc.log");
 	
-	if ( CheckParm ("-?") || CheckParm ("-help"))
+	Log_Print("MrElusive's QuakeC compiler v1.4, %s %s\n", __DATE__, __TIME__);
+	//Log_Print("This version is NOT for public distribution.\n");
+	Log_Print("This compiler is not supported by id Software.\n");
+	Log_Print("meqcc -help for info.\n\n");
+
+	if (NewCheckParm ("?") || NewCheckParm ("help") || NewCheckParm("h"))
 	{
-		printf ("qcc looks for progs.src in the current directory.\n");
-		printf ("to look in a different directory: qcc -src <directory>\n");
-		printf ("to build a clean data tree: qcc -copy <srcdir> <destdir>\n");
-		printf ("to build a clean pak file: qcc -pak <srcdir> <packfile>\n");
-		printf ("to bsp all bmodels: qcc -bspmodels <gamedir>\n");
+		Log_Print("meqcc looks for a progs.src in the current directory.\n");
+		Log_Print("Command line options:\n");
+		Log_Print("-src <directory>  look for a progs.src in the specified directory\n");
+		Log_Print("-undec            create progs.dat which cannot be decompiled\n");
+		Log_Print("-undec+           \" and write out undec.txt\n");
+		Log_Print("-asm <function>   output Quake ASM code of the specified function\n");
+		Log_Print("-d <define>       add a precompiler definition\n");
+		Log_Print("-?                display command line options\n");
+		Log_Print("-h                \"\n");
+		Log_Print("-help             \"\n");
 		return;
 	}
+
+	CMDPrecompilerDefinitions();
 	
-	p = CheckParm ("-src");
+	p = NewCheckParm("src");
 	if (p && p < argc-1 )
 	{
 		strcpy (sourcedir, argv[p+1]);
-		strcat (sourcedir, "/");
+		if (sourcedir[strlen(sourcedir)-1] != '/' &&
+			sourcedir[strlen(sourcedir)-1] != '\\')
+#if defined(_WIN32) || defined(WIN32)
+			strcat(sourcedir, "\\");
+#else
+			strcat(sourcedir, "/");
+#endif
 		printf ("Source directory: %s\n", sourcedir);
 	}
 	else
@@ -1076,6 +1543,9 @@ void main (int argc, char **argv)
 
 	InitData ();
 	
+	//check for undecompilable data
+	if (NewCheckParm("undec")) undecompilabledata = 1;
+	if (NewCheckParm("undec+")) undecompilabledata = 2;
 	sprintf (filename, "%sprogs.src", sourcedir);
 	LoadFile (filename, (void *)&src);
 	
@@ -1083,23 +1553,26 @@ void main (int argc, char **argv)
 	if (!src)
 		Error ("No destination filename.  qcc -help for info.\n");
 	strcpy (destfile, com_token);
-	printf ("outputfile: %s\n", destfile);
+	Log_Print("output file: %s\n", destfile);
 	
 	pr_dumpasm = false;
 
-	PR_BeginCompilation (malloc (0x100000), 0x100000);
+	PR_BeginCompilation (mymalloc(0x300000), 0x300000);
+
+	//the time started
+	start_time = clock();
 
 // compile all the files
 	do
 	{
+		//read next file from the progs.src
 		src = COM_Parse(src);
 		if (!src)
 			break;
 		sprintf (filename, "%s%s", sourcedir, com_token);
-		printf ("compiling %s\n", filename);
-		LoadFile (filename, (void *)&src2);
+		Log_Print("%s\n", filename);
 
-		if (!PR_CompileFile (src2, filename) )
+		if (!PR_CompileFile (filename))
 			exit (1);
 			
 	} while (1);
@@ -1107,7 +1580,8 @@ void main (int argc, char **argv)
 	if (!PR_FinishCompilation ())
 		Error ("compilation errors");
 
-	p = CheckParm ("-asm");
+	Log_Print("compilation time was %1.2f seconds\n", ((double) clock() - start_time) / CLOCKS_PER_SEC);
+	p = NewCheckParm ("asm");
 	if (p)
 	{
 		for (p++ ; p<argc ; p++)
@@ -1122,7 +1596,7 @@ void main (int argc, char **argv)
 // write progdefs.h
 	crc = PR_WriteProgdefs ("progdefs.h");
 	
-// write data file
+// write data file: progs.dat
 	WriteData (crc);
 	
 // regenerate bmodels if -bspmodels

@@ -28,7 +28,8 @@
 #include <ctype.h>
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/file.h>
+//#include <sys/file.h>
+#include <fcntl.h>
 #include <stdarg.h>
 
 #ifdef NeXT
@@ -51,8 +52,11 @@ extern char **myargv;
 
 char *strupr (char *in);
 char *strlower (char *in);
+/* MrE:   can't use these prototypes, they are inconsistant with
+               prototypes in original header files
 int filelength (int handle);
 int tell (int handle);
+*/
 
 double I_FloatTime (void);
 

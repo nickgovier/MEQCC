@@ -19,6 +19,7 @@
 
 #include "qcc.h"
 
+#include "math.h"   //fabs
 
 pr_info_t	pr;
 def_t		*pr_global_defs[MAX_REGS];	// to find def for a global variable
@@ -140,6 +141,153 @@ def_t	junkdef;
 
 //===========================================================================
 
+#define OPCODEHACK
+
+#ifdef OPCODEHACK
+
+#define OPCODEHASHSIZE		256
+
+opcode_t *opcodeindex[OPCODEHASHSIZE];
+
+/*
+============
+OpcodeHash
+============
+*/
+int OpcodeHash(char *opname)
+{
+	int len;
+
+	len = strlen(opname);
+	if (len > 2) return 0;
+	if (len > 1) return ((opname[0] + opname[1]) & (OPCODEHASHSIZE-1));
+	else return (opname[0] & (OPCODEHASHSIZE-1));
+//	return opname[0] + (opname[1] << 8);
+} //end of the function OpcodeHash
+
+/*
+============
+CreateOpcodeIndex
+============
+*/
+void CreateOpcodeIndex(void)
+{
+	opcode_t *op;
+	int value;
+
+	for (op = pr_opcodes; op->name; op++)
+	{
+		value = OpcodeHash(op->name);
+		if (!value) continue;
+		if (!opcodeindex[value])
+		{
+			opcodeindex[value] = op;
+		} //end if
+	} //end for
+} //end of the function CreateOpcodeIndex
+
+/*
+============
+PrintOpcodeHashValues
+============
+*/
+void PrintOpcodeHashValues(void)
+{
+	opcode_t *op;
+	int i;
+
+	for (op = pr_opcodes; op->name; op++)
+	{
+		printf("%-6s = %d\n", op->name, OpcodeHash(op->name));
+	} //end for
+	CreateOpcodeIndex();
+	for (i = 0; i < OPCODEHASHSIZE; i++)
+	{
+		if (opcodeindex[i]) printf("%3d = %s\n", i, opcodeindex[i]->name);
+	} //end for
+} //end of the function PrintOpcodeHashValues
+
+#endif //OPCODEHACK
+
+#define HASHING
+
+#ifdef HASHING
+
+#define DEFHASHSIZE		2048
+def_t *defvaluehash[DEFHASHSIZE];
+def_t *defnamehash[DEFHASHSIZE];
+
+/*
+============
+NameHash
+============
+*/
+int NameHash(char *name)
+{
+	int register hash, i;
+
+	hash = 0;
+	for (i = 0; name[i] != '\0'; i++)
+	{
+		hash += name[i] * (119 + i);
+		//hash += (name[i] << 7) + i;
+		//hash += (name[i] << (i&15));
+	} //end while
+	hash = (hash ^ (hash >> 10) ^ (hash >> 20)) & (DEFHASHSIZE-1);
+	return hash;
+} //end of the function NameHash
+
+/*
+============
+DefValueHash
+============
+*/
+int DefValueHash(type_t *type, char *ptr)
+{
+	int hash;
+	unsigned long int value;
+
+	if (type == &type_string)
+	{
+		return NameHash(ptr);
+	} //end if
+	else
+	{
+		//memcpy(&value, &G_FLOAT(ofs), 4);
+		value = (int) (fabs(*(float *) ptr) * 2);
+	} //end else
+	hash = value;
+	hash &= (DEFHASHSIZE-1);
+	return hash;
+} //end of the function DefValueHash
+
+/*
+============
+AddDefToHash
+============
+*/
+void AddDefToHash(def_t *def)
+{
+	int hash;
+
+	if (def->initialized)
+	if (def->type == &type_string ||
+			def->type == &type_float ||
+			def->type == &type_vector)
+	{
+		//add to value hash
+		if (def->type == &type_string) hash = DefValueHash(def->type, G_STRING(def->ofs));
+		else hash = DefValueHash(def->type, (char *) &G_FLOAT(def->ofs));
+		def->valuehashnext = defvaluehash[hash];
+		defvaluehash[hash] = def;
+	} //end if
+	//add to name hash
+	hash = NameHash(def->name);
+	def->namehashnext = defnamehash[hash];
+	defnamehash[hash] = def;
+} //end of the function AddDefToHash
+
+#endif //HASHING
 
 /*
 ============
@@ -168,13 +316,17 @@ def_t *PR_Statement ( opcode_t *op, def_t *var_a, def_t *var_b)
 	}
 	else
 	{	// allocate result space
-		var_c = malloc (sizeof(def_t));
+		var_c = mymalloc (sizeof(def_t));
 		memset (var_c, 0, sizeof(def_t));
 		var_c->ofs = numpr_globals;
 		var_c->type = op->type_c->type;
 
 		statement->c = numpr_globals;
 		numpr_globals += type_size[op->type_c->type->type];
+		CHECK_PR_GLOBALS_BUFFER;
+//#ifdef HASHING
+//		AddDefToHash(var_c);
+//#endif //HASHING
 	}
 
 	if (op->right_associative)
@@ -189,12 +341,25 @@ PR_ParseImmediate
 Looks for a preexisting constant
 ============
 */
+
+extern int pr_globals_isstring[MAX_REGS];
+
 def_t	*PR_ParseImmediate (void)
 {
 	def_t	*cn;
 	
 // check for a constant with the same value
+#ifdef HASHING
+	int hash;
+
+	if (pr_immediate_type == &type_string)
+		hash = DefValueHash(pr_immediate_type, pr_immediate_string);
+	else
+		hash = DefValueHash(pr_immediate_type, (char *) &pr_immediate._float);
+	for (cn = defvaluehash[hash]; cn; cn = cn->valuehashnext)
+#else
 	for (cn=pr.def_head.next ; cn ; cn=cn->next)
+#endif
 	{
 		if (!cn->initialized)
 			continue;
@@ -231,24 +396,33 @@ def_t	*PR_ParseImmediate (void)
 	}
 	
 // allocate a new one
-	cn = malloc (sizeof(def_t));
+	cn = mymalloc (sizeof(def_t));
 	cn->next = NULL;
 	pr.def_tail->next = cn;
 	pr.def_tail = cn;
 	cn->type = pr_immediate_type;
 	cn->name = "IMMEDIATE";
 	cn->initialized = 1;
+	cn->internuse = 0;
 	cn->scope = NULL;		// always share immediates
 
 // copy the immediate to the global area
 	cn->ofs = numpr_globals;
 	pr_global_defs[cn->ofs] = cn;
 	numpr_globals += type_size[pr_immediate_type->type];
+	CHECK_PR_GLOBALS_BUFFER;
 	if (pr_immediate_type == &type_string)
+	{
 		pr_immediate.string = CopyString (pr_immediate_string);
 	
+		pr_globals_isstring[cn->ofs] = 1;
+	} //end if
 	memcpy (pr_globals + cn->ofs, &pr_immediate, 4*type_size[pr_immediate_type->type]);
 	
+#ifdef HASHING
+	AddDefToHash(cn);
+#endif //HASHING
+
 	PR_Lex ();
 
 	return cn;
@@ -287,8 +461,8 @@ void PrecacheModel (def_t *e, int ch)
 	for (i=0 ; i<nummodels ; i++)
 		if (!strcmp(n, precache_models[i]))
 			return;
-	if (numsounds == MAX_SOUNDS)
-		Error ("PrecacheModels: numsounds == MAX_SOUNDS");
+	if (nummodels == MAX_SOUNDS)
+		Error ("PrecacheModels: nummodels == MAX_MODELS");
 	strcpy (precache_models[i], n);
 	if (ch >= '1'  && ch <= '9')
 		precache_models_block[i] = ch - '0';
@@ -334,6 +508,8 @@ def_t *PR_ParseFunctionCall (def_t *func)
 	if (t->type != ev_function)
 		PR_ParseError ("not a function");
 	
+	//MrE: function is called from inside the Quake C code
+	func->internuse = 1;
 // copy the arguments to the global parameter variables
 	arg = 0;
 	if (!PR_Check(")"))
@@ -363,13 +539,17 @@ def_t *PR_ParseFunctionCall (def_t *func)
 			arg++;
 		} while (PR_Check (","));
 	
-		if (t->num_parms != -1 && arg != t->num_parms)
-			PR_ParseError ("too few parameters");
+//		if (t->num_parms != -1 && arg != t->num_parms)
+//			PR_ParseError ("too few parameters");
 		PR_Expect (")");
 	}
 	if (arg >8)
 		PR_ParseError ("More than eight parameters");
 		
+	if (t->num_parms != -1 && arg != t->num_parms)
+	{
+		PR_ParseError("too few parameters");
+	} //end if
 
 	PR_Statement (&pr_opcodes[OP_CALL0+arg], func, 0);
 	
@@ -467,12 +647,26 @@ def_t *PR_Expression (int priority)
 		if (priority == 1 && PR_Check ("(") )
 			return PR_ParseFunctionCall (e);
 
+		//find the operator
+#ifdef OPCODEHACK
+		op = opcodeindex[OpcodeHash(pr_token)];
+		if (!op) break;
+		if (!op->name) break;
+		if (op->priority != priority) break;
+		if (!PR_Check(op->name)) break;
+#else
 		for (op=pr_opcodes ; op->name ; op++)
 		{
 			if (op->priority != priority)
 				continue;
-			if (!PR_Check (op->name))
-				continue;
+			if ( PR_Check (op->name))
+				break;
+
+		} //end for
+		if (!op->name)
+			break;
+#endif //OPCODEHACK
+
 			if ( op->right_associative )
 			{
 			// if last statement is an indirect, change it to an address of
@@ -490,6 +684,11 @@ def_t *PR_Expression (int priority)
 		// type check
 			type_a = e->type->type;
 			type_b = e2->type->type;
+		//MrE function is used intern in an assignment
+		if (e2->type->type == ev_function)
+		{
+			e2->internuse = 1;
+		}
 
 			if (op->name[0] == '.')// field access gets type from field
 			{
@@ -512,7 +711,7 @@ def_t *PR_Expression (int priority)
 			}
 			
 			if (type_a == ev_pointer && type_b != e->type->aux_type->type)
-				PR_ParseError ("type mismatch for %s", op->name);
+				PR_ParseError ("type mismatch for %s 2", op->name);
 			
 			
 			if (op->right_associative)
@@ -523,10 +722,6 @@ def_t *PR_Expression (int priority)
 			if (type_c != ev_void)	// field access gets type from field
 				e->type = e2->type->aux_type;
 			
-			break;
-		}
-		if (!op->name)
-			break;	// next token isn't at this priority level
 	}
 	
 	return e;
@@ -664,6 +859,9 @@ void PR_ParseState (void)
 	name = PR_ParseName ();
 	def = PR_GetDef (&type_function, name,0, true);
 		
+	//MrE: the function is used intern
+	def->internuse = true;
+
 	PR_Expect ("]");
 	
 	PR_Statement (&pr_opcodes[OP_STATE], s1, def);
@@ -682,7 +880,7 @@ function_t *PR_ParseImmediateStatements (type_t *type)
 	function_t	*f;
 	def_t		*defs[MAX_PARMS];
 	
-	f = malloc (sizeof(function_t));
+	f = mymalloc (sizeof(function_t));
 
 //
 // check for builtin function definition #1, #2, etc
@@ -747,28 +945,39 @@ def_t *PR_GetDef (type_t *type, char *name, def_t *scope, boolean allocate)
 	char element[MAX_NAME];
 
 // see if the name is already in use
+#ifdef HASHING
+	int hash;
+
+	hash = NameHash(name);
+	for (def = defnamehash[hash]; def; def = def->namehashnext)
+#else //HASHING
 	for (def = pr.def_head.next ; def ; def = def->next)
-		if (!strcmp(def->name,name) )
-		{
-			if ( def->scope && def->scope != scope)
-				continue;		// in a different function
-			
+#endif //HASHING
+	{
+		//if global or in the same function
+			if (!def->scope || def->scope == scope)
+			{
+			//if using the same name
+			if (!strcmp(def->name, name))
+			{
 			if (type && def->type != type)
 				PR_ParseError ("Type mismatch on redeclaration of %s",name);
 			return def;
+			}
 		}
+	}
 	
 	if (!allocate)
 		return NULL;
 		
 // allocate a new def
-	def = malloc (sizeof(def_t));
+	def = mymalloc (sizeof(def_t));
 	memset (def, 0, sizeof(*def));
 	def->next = NULL;
 	pr.def_tail->next = def;
 	pr.def_tail = def;
 	
-	def->name = malloc (strlen(name)+1);
+	def->name = mymalloc (strlen(name)+1);
 	strcpy (def->name, name);
 	def->type = type;
 
@@ -777,6 +986,9 @@ def_t *PR_GetDef (type_t *type, char *name, def_t *scope, boolean allocate)
 	def->ofs = numpr_globals;
 	pr_global_defs[numpr_globals] = def;
 
+#ifdef HASHING
+	AddDefToHash(def);
+#endif //HASHING	
 //
 // make automatic defs for the vectors elements
 // .origin can be accessed as .origin_x, .origin_y, and .origin_z
@@ -793,7 +1005,10 @@ def_t *PR_GetDef (type_t *type, char *name, def_t *scope, boolean allocate)
 		PR_GetDef (&type_float, element, scope, true);
 	}
 	else
+	{
 		numpr_globals += type_size[type->type];
+		CHECK_PR_GLOBALS_BUFFER;
+	}
 
 	if (type->type == ev_field)
 	{
@@ -869,6 +1084,7 @@ void PR_ParseDefs (void)
 		// fill in the dfunction
 				df = &functions[numfunctions];
 				numfunctions++;
+				CHECK_FUNCTIONS_BUFFER;
 				if (f->builtin)
 					df->first_statement = -f->builtin;
 				else
@@ -903,20 +1119,21 @@ PR_CompileFile
 compiles the 0 terminated text, adding defintions to the pr structure
 ============
 */
-boolean	PR_CompileFile (char *string, char *filename)
-{	
+boolean	PR_CompileFile (char *filename)
+{  
+#ifdef OPCODEHACK
+	CreateOpcodeIndex();
+#endif //OPCODEHACK
+	//
 	if (!pr.memory)
 		Error ("PR_CompileFile: Didn't clear");
 
 	PR_ClearGrabMacros ();	// clear the frame macros
 		
-	pr_file_p = string;
 	s_file = CopyString (filename);
-
-	pr_source_line = 0;
+	//load the source file
+	PR_LoadSource(filename);
 	
-	PR_NewLine ();
-
 	PR_Lex ();	// read first token
 
 	while (pr_token_type != tt_eof)
@@ -935,6 +1152,9 @@ boolean	PR_CompileFile (char *string, char *filename)
 		PR_ParseDefs ();
 	}
 	
+	//free the source file
+	PR_FreeSource();
+	//return true if there were no errors
 	return (pr_error_count == 0);
 }
 

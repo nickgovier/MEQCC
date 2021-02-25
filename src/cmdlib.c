@@ -19,7 +19,8 @@
 // cmdlib.c
 
 #include "cmdlib.h"
-#include <sys/time.h>
+#include <time.h>
+#include <io.h>
 
 #define PATHSEPERATOR   '/'
 
@@ -37,20 +38,33 @@ I_FloatTime
 */
 double I_FloatTime (void)
 {
-	struct timeval tp;
-	struct timezone tzp;
-	static int		secbase;
-
-	gettimeofday(&tp, &tzp);
+	time_t	t;
 	
-	if (!secbase)
-	{
-		secbase = tp.tv_sec;
-		return tp.tv_usec/1000000.0;
-	}
+	time (&t);
 	
-	return (tp.tv_sec - secbase) + tp.tv_usec/1000000.0;
+	return t;
 }
+
+/*
+================
+I_FloatTime
+================
+double I_FloatTime (void)
+{
+   struct timeval tp;
+   struct timezone tzp;
+   static int     secbase;
+
+   gettimeofday(&tp, &tzp);
+   
+   if (!secbase)
+   {
+      secbase = tp.tv_sec;
+      return tp.tv_usec/1000000.0;
+   }
+   
+   return (tp.tv_sec - secbase) + tp.tv_usec/1000000.0;
+}*/
 
 
 /*
@@ -141,19 +155,30 @@ skipwhite:
 filelength
 ================
 */
-int filelength (int handle)
+long int filelength (int handle)
 {
-	struct stat	fileinfo;
-    
+	/*
+	struct stat fileinfo;
+
 	if (fstat (handle,&fileinfo) == -1)
 	{
 		Error ("Error fstating");
 	}
 
 	return fileinfo.st_size;
+	*/
+	int pos;
+	int end;
+
+	pos = tell(handle);
+	lseek(handle, 0, SEEK_END);
+	end = tell(handle);
+	lseek(handle, pos, SEEK_SET);
+
+	return end;
 }
 
-int tell (int handle)
+long int tell (int handle)
 {
 	return lseek (handle, 0, SEEK_CUR);
 }
@@ -226,7 +251,7 @@ int CheckParm (char *check)
 
 	for (i = 1;i<myargc;i++)
 	{
-		if ( !strcasecmp(check, myargv[i]) )
+		if ( !strcmpi(check, myargv[i]) )
 			return i;
 	}
 
@@ -242,7 +267,7 @@ int SafeOpenWrite (char *filename)
 {
 	int     handle;
 
-	umask (0);
+//   umask (0);
 	
 	handle = open(filename,O_WRONLY | O_CREAT | O_TRUNC | O_BINARY
 	, 0666);

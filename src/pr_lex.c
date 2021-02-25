@@ -17,9 +17,18 @@
     See file, 'COPYING', for details.
 */
 
+// pr_lex.c
+
 #include "qcc.h"
 
+#ifdef PRECOMP
+#include "l_script.h"
+#include "l_precomp.h"
+#include "l_log.h"
+#endif //PRECOMP
+
 int			pr_source_line;
+char *pr_file_buf;					//buffer with the file
 
 char		*pr_file_p;
 char		*pr_line_start;		// start of current source line
@@ -69,6 +78,10 @@ def_t	*def_for_type[8] = {&def_void, &def_string, &def_float, &def_vector, &def_
 
 void PR_LexWhitespace (void);
 
+#ifdef PRECOMP
+source_t *pr_source;
+#endif //PRECOMP
+
 
 /*
 ==============
@@ -114,6 +127,41 @@ void PR_NewLine (void)
 }
 
 /*
+============
+PR_LoadSource
+============
+*/
+void PR_LoadSource(char *filename)
+{
+	pr_source_line = 0;
+#ifdef PRECOMP
+	pr_source = LoadSourceFile(filename);
+	if (!pr_source)
+		Error("couldn't load the file %s\n", filename);
+#else
+	LoadFile(filename, (void *)&pr_file_buf);
+	pr_file_p = pr_file_buf;
+	PR_NewLine();
+#endif //PRECOMP
+} //end of the function PR_LoadSource
+
+/*
+============
+PR_FreeSource
+============
+*/
+void PR_FreeSource(void)
+{
+#ifdef PRECOMP
+	if (pr_source)
+		FreeSource(pr_source);
+#else //PRECOMP
+	if (pr_file_buf)
+		free(pr_file_buf);
+#endif //PRECOMP
+} //end of the function PR_FreeSource
+
+/*
 ==============
 PR_LexString
 
@@ -122,11 +170,13 @@ Parses a quoted string
 */
 void PR_LexString (void)
 {
-	int		c;
+	int		c, i, asciicode;
 	int		len;
 	
 	len = 0;
+	//first character after the double quote
 	pr_file_p++;
+	//now read the string
 	do
 	{
 		c = *pr_file_p++;
@@ -143,6 +193,25 @@ void PR_LexString (void)
 				c = '\n';
 			else if (c == '"')
 				c = '"';
+//#if NEW_FEATURE
+			else if (c >= '0' && c <= '9')
+			{
+				asciicode = c - '0';
+				for (i = 0; i < 2; i++)
+				{
+					c = *pr_file_p++;
+					if (!c)
+						PR_ParseError ("EOF inside quote");
+					if (c < '0' || c > '9')
+                  				PR_ParseError("invalid character in ASCII code");
+               				asciicode *= 10;
+               				asciicode += c - '0';
+            			}
+            			if (asciicode < 0x01 || asciicode > 0xFF)
+					PR_ParseError("invalid ASCII code");
+            			c = asciicode;
+         		}
+//#endif
 			else
 				PR_ParseError ("Unknown escape char");
 		}
@@ -179,7 +248,7 @@ float PR_LexNumber (void)
 		c = *pr_file_p;
 	} while ((c >= '0' && c<= '9') || c == '.');
 	pr_token[len] = 0;
-	return atof (pr_token);
+	return (float) atof (pr_token);
 }
 
 /*
@@ -336,13 +405,29 @@ void PR_FindMacro (void)
 			sprintf (pr_token,"%d", i);
 			pr_token_type = tt_immediate;
 			pr_immediate_type = &type_float;
-			pr_immediate._float = i;
+			pr_immediate._float = (float) i;
 			return;
 		}
 	PR_ParseError ("Unknown frame macro $%s", pr_token);
 }
 
 // just parses text, returning false if an eol is reached
+#ifdef PRECOMP
+
+boolean PR_SimpleGetToken (void)
+{
+	token_t token;
+
+	if (!PC_ReadLine(pr_source, &token))
+	{
+		return false;
+	} //end if
+	strcpy(pr_token, token.string);
+	return true;
+} //end of the function PR_SimpeGetToken
+
+#else //PRECOMP
+
 boolean PR_SimpleGetToken (void)
 {
 	int		c;
@@ -366,6 +451,8 @@ boolean PR_SimpleGetToken (void)
 	pr_token[i] = 0;
 	return true;
 }
+
+#endif //PRECOMP
 
 void PR_ParseFrame (void)
 {
@@ -421,6 +508,97 @@ PR_Lex
 Sets pr_token, pr_token_type, and possibly pr_immediate and pr_immediate_type
 ==============
 */
+#ifdef PRECOMP
+
+void PR_Lex(void)
+{
+	token_t token, tmptoken;
+
+	pr_token[0] = 0;
+
+	if (!PC_ReadToken(pr_source, &token))
+	{
+		pr_token_type = tt_eof;
+		return;
+	}
+
+	pr_source_line = token.line;
+
+	switch(token.type)
+	{
+		case TT_STRING: //string
+		{
+			StripDoubleQuotes(token.string);
+			pr_token_type = tt_immediate;
+			pr_immediate_type = &type_string;
+			strcpy(pr_immediate_string, token.string);
+			break;
+		} //end case
+		case TT_LITERAL: //vector
+		{
+			pr_token_type = tt_immediate;
+			pr_immediate_type = &type_vector;
+			sscanf(token.string, "'%f %f %f'",
+					&pr_immediate.vector[0],
+						&pr_immediate.vector[1],
+							&pr_immediate.vector[2]);
+			break;
+		} //end case
+		case TT_PUNCTUATION:
+		{
+			//QuakeC frame macros
+			if (token.string[0] == '$')
+			{
+				PR_LexGrab();
+				break;
+			} //end if
+			//special handling for negative numbers
+			else if (token.string[0] == '-')
+			{
+				if (PC_ReadToken(pr_source, &tmptoken))
+				{
+					if (tmptoken.type == TT_NUMBER && !PC_WhiteSpaceBeforeToken(&tmptoken))
+					{
+						strcpy(pr_token, "-");
+						strcat(pr_token, tmptoken.string);
+						pr_token_type = tt_immediate;
+						pr_immediate_type = &type_float;
+						pr_immediate._float = (float) -tmptoken.floatvalue;
+						break;
+					} //end if
+					else
+					{
+						PC_UnreadToken(pr_source, &tmptoken);
+					} //end else
+				} //end if
+			} //end else if
+			else if (token.string[0] == '{')
+				pr_bracelevel++;
+			else if (token.string[0] == '}')
+				pr_bracelevel--;
+			pr_token_type = tt_punct;
+			strcpy(pr_token, token.string);
+			break;
+		} //end case
+		case TT_NAME:
+		{
+			pr_token_type = tt_name;
+			strcpy(pr_token, token.string);
+			break;
+		} //end case
+		case TT_NUMBER:
+		{
+			strcat(pr_token, token.string);
+			pr_token_type = tt_immediate;
+			pr_immediate_type = &type_float;
+			pr_immediate._float = (float) token.floatvalue;
+			break;
+		} //end case
+	} //end switch
+} //end of the function PR_Lex
+
+#else
+
 void PR_Lex (void)
 {
 	int		c;
@@ -482,6 +660,7 @@ void PR_Lex (void)
 // parse symbol strings until a non-symbol is found
 	PR_LexPunctuation ();
 }
+#endif
 
 //=============================================================================
 
@@ -501,8 +680,8 @@ void PR_ParseError (char *error, ...)
 	vsprintf (string,error,argptr);
 	va_end (argptr);
 
-	printf ("%s:%i:%s\n", strings + s_file, pr_source_line, string);
-	
+	Log_Print("%s:%i:%s\n", strings + s_file, pr_source_line, string);
+
 	longjmp (pr_parse_abort, 1);
 }
 
@@ -591,13 +770,13 @@ type_t *PR_FindType (type_t *type)
 	}
 	
 // allocate a new one
-	check = malloc (sizeof (*check));
+	check = mymalloc (sizeof (*check));
 	*check = *type;
 	check->next = pr.types;
 	pr.types = check;
 	
 // allocate a generic def for the type, so fields can reference it
-	def = malloc (sizeof(def_t));
+	def = mymalloc (sizeof(def_t));
 	def->name = "COMPLEX TYPE";
 	def->type = check;
 	check->def = def;
